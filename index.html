@@ -88,7 +88,7 @@
   .upload-icon { font-size: 2.5rem; margin-bottom: 10px; }
   .upload-zone p { color: var(--muted); font-size: 14px; }
   .upload-zone strong { color: var(--accent); }
-  #file-input { display: none; }
+  #file-input-u { display: none !important; position: absolute; width: 0; height: 0; opacity: 0; pointer-events: none; }
 
   /* REVIEW SECTION */
   .review-section { background: var(--paper); border: 1.5px solid var(--border); border-radius: 12px; padding: 20px; margin-bottom: 16px; }
@@ -260,6 +260,12 @@
     <div class="workflow-badge">📄 Have a CV</div>
     <div class="card-title">Review your information</div>
     <div class="card-subtitle">We've extracted this from your CV. Edit anything that doesn't look right before generating.</div>
+
+    <!-- Parsing loading notice -->
+    <div id="review-parsing-notice" style="display:none;background:#fff8e1;border:1px solid var(--gold);border-radius:8px;padding:12px 16px;font-size:13px;color:#7a5c00;margin-bottom:16px;align-items:center;gap:10px;">
+      <div class="spinner" style="width:20px;height:20px;border-width:3px;flex-shrink:0;"></div>
+      Parsing your CV with AI — this takes a few seconds...
+    </div>
 
     <!-- Personal Info -->
     <div class="review-section">
@@ -570,6 +576,7 @@ let uSkills = [], sSkills = [];
 let uTone = 'Professional', sTone = 'Professional';
 let uExpCount = 0, uEduCount = 0, sExpCount = 0, sEduCount = 0;
 let extractedRaw = '';
+let extractionDone = false;
 let lastGenData = null;
 
 // Progress configs per workflow
@@ -669,12 +676,11 @@ async function processPDF(file) {
     document.getElementById('upload-zone-u').classList.add('uploaded');
     document.getElementById('upload-icon-u').textContent = '✅';
     document.getElementById('upload-text-u').innerHTML = `<strong>${file.name}</strong> uploaded successfully`;
-    document.getElementById('upload-sub-u').textContent = `${pdf.numPages} page(s) extracted`;
+    document.getElementById('upload-sub-u').textContent = `${pdf.numPages} page(s) · ready to continue`;
     document.getElementById('extracted-notice-u').style.display = 'block';
     document.getElementById('u1-next').disabled = false;
     document.getElementById('u1-next').style.opacity = '1';
-    // Pre-parse with AI in background
-    prefillFromPDF(text);
+    extractionDone = false; // will parse when user hits Review
   } catch {
     document.getElementById('extract-loading-u').style.display = 'none';
     document.getElementById('upload-zone-u').style.opacity = '1';
@@ -683,23 +689,29 @@ async function processPDF(file) {
 }
 
 async function prefillFromPDF(text) {
+  extractionDone = false;
   try {
-    const prompt = `Extract structured info from this CV. Return ONLY valid JSON, no markdown, no explanation:
+    const prompt = `Extract structured info from this CV. Return ONLY valid JSON, no markdown, no explanation, no preamble:
 {"fname":"","lname":"","email":"","phone":"","location":"","linkedin":"","portfolio":"","github":"","summary":"","skills":[],"experience":[{"title":"","company":"","start":"","end":"","desc":""}],"education":[{"degree":"","school":"","years":"","grade":""}],"certs":"","languages":""}
-CV text: ${text.substring(0,4000)}`;
+CV text: ${text.substring(0,5000)}`;
     const raw = await callWorker(prompt, 'extract');
-    const parsed = JSON.parse(raw.replace(/```json|```/g,'').trim());
-    // Fill personal fields
+    // Strip any markdown fences or extra text before first {
+    const jsonStart = raw.indexOf('{');
+    const jsonEnd = raw.lastIndexOf('}');
+    if (jsonStart === -1 || jsonEnd === -1) throw new Error('No JSON found');
+    const parsed = JSON.parse(raw.slice(jsonStart, jsonEnd + 1));
+
     const map = {fname:'u-fname',lname:'u-lname',email:'u-email',phone:'u-phone',location:'u-location',linkedin:'u-linkedin',portfolio:'u-portfolio',github:'u-github',summary:'u-summary'};
     Object.entries(map).forEach(([k,id]) => { if (parsed[k]) { const el = document.getElementById(id); if(el) el.value = parsed[k]; }});
-    // Skills
     if (parsed.skills?.length) { parsed.skills.forEach(s => { if (s && !uSkills.includes(s)) { uSkills.push(s); renderSkillTag(s,'u'); }}); }
-    // Experience
     if (parsed.experience?.length) { document.getElementById('u-experience-list').innerHTML=''; uExpCount=0; parsed.experience.filter(e=>e.title||e.company).forEach(e=>addExperience('u',e)); }
-    // Education
     if (parsed.education?.length) { document.getElementById('u-education-list').innerHTML=''; uEduCount=0; parsed.education.filter(e=>e.degree||e.school).forEach(e=>addEducation('u',e)); }
-    updateReviewSummaries();
-  } catch { /* silent — user can edit on review screen */ }
+    extractionDone = true;
+  } catch(err) {
+    // Extraction failed — let user know on review screen
+    extractionDone = true;
+    console.warn('Extraction failed:', err.message);
+  }
 }
 
 function nextFromU1() {
@@ -707,10 +719,20 @@ function nextFromU1() {
   goToStep('U2');
 }
 
-function nextFromU2() {
+
+async function nextFromU2() {
   if (!gv('u-job-title') || !gv('u-job-desc')) { alert('Please fill in the job title and description.'); return; }
+  // If extraction hasn't completed yet, run it now and show a loading state
+  if (!extractionDone && extractedRaw) {
+    goToStep('U3');
+    const notice = document.getElementById('review-parsing-notice');
+    if (notice) notice.style.display = 'flex';
+    await prefillFromPDF(extractedRaw);
+    if (notice) notice.style.display = 'none';
+  } else {
+    goToStep('U3');
+  }
   updateReviewSummaries();
-  goToStep('U3');
 }
 
 function updateReviewSummaries() {
