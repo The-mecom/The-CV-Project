@@ -665,12 +665,35 @@ async function processPDF(file) {
   document.getElementById('upload-zone-u').style.opacity = '0.4';
   try {
     const pdf = await pdfjsLib.getDocument({ data: await file.arrayBuffer() }).promise;
-    let text = '';
-    for (let i = 1; i <= pdf.numPages; i++) {
-      const pg = await pdf.getPage(i);
-      text += (await pg.getTextContent()).items.map(it => it.str).join(' ') + '\n';
+
+    // Positional extraction — sorts items by Y then X so multi-column CVs read correctly
+    let allItems = [];
+    for (let p = 1; p <= pdf.numPages; p++) {
+      const pg = await pdf.getPage(p);
+      const content = await pg.getTextContent();
+      const vp = pg.getViewport({ scale: 1 });
+      content.items.forEach(item => {
+        if (!item.str.trim()) return;
+        const y = vp.height - item.transform[5]; // flip Y (PDF origin is bottom-left)
+        const x = item.transform[4];
+        allItems.push({ str: item.str, x, y, page: p });
+      });
     }
-    extractedRaw = text;
+    allItems.sort((a, b) => a.page - b.page || Math.round(a.y/4) - Math.round(b.y/4) || a.x - b.x);
+
+    // Group into lines by Y proximity
+    let lines = [], cur = [], lastRow = null;
+    allItems.forEach(item => {
+      const row = Math.round(item.y / 4);
+      if (lastRow !== null && Math.abs(row - lastRow) > 2) {
+        if (cur.length) lines.push(cur.map(i=>i.str).join(' ').trim());
+        cur = [];
+      }
+      cur.push(item); lastRow = row;
+    });
+    if (cur.length) lines.push(cur.map(i=>i.str).join(' ').trim());
+    extractedRaw = lines.filter(Boolean).join('\n');
+
     document.getElementById('extract-loading-u').style.display = 'none';
     document.getElementById('upload-zone-u').style.opacity = '1';
     document.getElementById('upload-zone-u').classList.add('uploaded');
@@ -680,38 +703,168 @@ async function processPDF(file) {
     document.getElementById('extracted-notice-u').style.display = 'block';
     document.getElementById('u1-next').disabled = false;
     document.getElementById('u1-next').style.opacity = '1';
-    extractionDone = false; // will parse when user hits Review
-  } catch {
+    extractionDone = false;
+  } catch(err) {
     document.getElementById('extract-loading-u').style.display = 'none';
     document.getElementById('upload-zone-u').style.opacity = '1';
-    alert('Could not read this PDF. Please try another file or check it isn\'t password protected.');
+    console.error('PDF error:', err);
+    alert('Could not read this PDF. Make sure it is not password protected.');
   }
 }
 
 async function prefillFromPDF(text) {
   extractionDone = false;
   try {
-    const prompt = `Extract structured info from this CV. Return ONLY valid JSON, no markdown, no explanation, no preamble:
-{"fname":"","lname":"","email":"","phone":"","location":"","linkedin":"","portfolio":"","github":"","summary":"","skills":[],"experience":[{"title":"","company":"","start":"","end":"","desc":""}],"education":[{"degree":"","school":"","years":"","grade":""}],"certs":"","languages":""}
-CV text: ${text.substring(0,5000)}`;
-    const raw = await callWorker(prompt, 'extract');
-    // Strip any markdown fences or extra text before first {
-    const jsonStart = raw.indexOf('{');
-    const jsonEnd = raw.lastIndexOf('}');
-    if (jsonStart === -1 || jsonEnd === -1) throw new Error('No JSON found');
-    const parsed = JSON.parse(raw.slice(jsonStart, jsonEnd + 1));
+    // Step 1: Fast regex extraction (no API call needed for well-structured data)
+    const parsed = regexExtract(text);
 
-    const map = {fname:'u-fname',lname:'u-lname',email:'u-email',phone:'u-phone',location:'u-location',linkedin:'u-linkedin',portfolio:'u-portfolio',github:'u-github',summary:'u-summary'};
-    Object.entries(map).forEach(([k,id]) => { if (parsed[k]) { const el = document.getElementById(id); if(el) el.value = parsed[k]; }});
-    if (parsed.skills?.length) { parsed.skills.forEach(s => { if (s && !uSkills.includes(s)) { uSkills.push(s); renderSkillTag(s,'u'); }}); }
-    if (parsed.experience?.length) { document.getElementById('u-experience-list').innerHTML=''; uExpCount=0; parsed.experience.filter(e=>e.title||e.company).forEach(e=>addExperience('u',e)); }
-    if (parsed.education?.length) { document.getElementById('u-education-list').innerHTML=''; uEduCount=0; parsed.education.filter(e=>e.degree||e.school).forEach(e=>addEducation('u',e)); }
+    // Step 2: If regex missed critical fields, use AI as fallback
+    if (!parsed.fname || !parsed.experience.length) {
+      try {
+        const prompt = `Extract info from this CV. Return ONLY a valid JSON object, no markdown, no text before or after the JSON.
+Schema: {"fname":"","lname":"","email":"","phone":"","location":"","linkedin":"","portfolio":"","github":"","summary":"","skills":[],"experience":[{"title":"","company":"","start":"","end":"","desc":""}],"education":[{"degree":"","school":"","years":"","grade":""}]}
+CV: ${text.substring(0,6000)}`;
+        const raw = await callWorker(prompt, 'extract');
+        const j1 = raw.indexOf('{'), j2 = raw.lastIndexOf('}');
+        if (j1 !== -1 && j2 !== -1) {
+          const ai = JSON.parse(raw.slice(j1, j2 + 1));
+          if (!parsed.fname && ai.fname) parsed.fname = ai.fname;
+          if (!parsed.lname && ai.lname) parsed.lname = ai.lname;
+          if (!parsed.email && ai.email) parsed.email = ai.email;
+          if (!parsed.phone && ai.phone) parsed.phone = ai.phone;
+          if (!parsed.location && ai.location) parsed.location = ai.location;
+          if (!parsed.linkedin && ai.linkedin) parsed.linkedin = ai.linkedin;
+          if (!parsed.summary && ai.summary) parsed.summary = ai.summary;
+          if (!parsed.skills.length && ai.skills?.length) parsed.skills = ai.skills;
+          if (!parsed.experience.length && ai.experience?.length) parsed.experience = ai.experience.filter(e=>e.title||e.company);
+          if (!parsed.education.length && ai.education?.length) parsed.education = ai.education.filter(e=>e.degree||e.school);
+        }
+      } catch(aiErr) { console.warn('AI fallback failed:', aiErr.message); }
+    }
+
+    // Step 3: Populate the form fields
+    const fm = {fname:'u-fname',lname:'u-lname',email:'u-email',phone:'u-phone',location:'u-location',linkedin:'u-linkedin',portfolio:'u-portfolio',github:'u-github',summary:'u-summary'};
+    Object.entries(fm).forEach(([k,id]) => { if (parsed[k]) { const el=document.getElementById(id); if(el) el.value=parsed[k]; }});
+    if (parsed.skills.length) { parsed.skills.forEach(s => { if(s&&!uSkills.includes(s)){ uSkills.push(s); renderSkillTag(s,'u'); }}); }
+    if (parsed.experience.length) { document.getElementById('u-experience-list').innerHTML=''; uExpCount=0; parsed.experience.forEach(e=>addExperience('u',e)); }
+    if (parsed.education.length) { document.getElementById('u-education-list').innerHTML=''; uEduCount=0; parsed.education.forEach(e=>addEducation('u',e)); }
     extractionDone = true;
-  } catch(err) {
-    // Extraction failed — let user know on review screen
-    extractionDone = true;
-    console.warn('Extraction failed:', err.message);
+  } catch(err) { extractionDone = true; console.warn('prefill error:', err); }
+}
+
+// Regex-based CV parser — works on positionally-sorted line-by-line text
+function regexExtract(text) {
+  const lines = text.split('\n').map(l=>l.trim()).filter(Boolean);
+  const result = { fname:'', lname:'', email:'', phone:'', location:'', linkedin:'', portfolio:'', github:'', summary:'', skills:[], experience:[], education:[] };
+
+  // Contact info via regex on full text
+  const emailM = text.match(/[\w.+-]+@[\w-]+\.[a-z]{2,}/i);
+  if (emailM) result.email = emailM[0];
+
+  const phoneM = text.match(/(\+?[\d][\d\s\-().]{6,16}\d)/);
+  if (phoneM) result.phone = phoneM[0].trim();
+
+  const liM = text.match(/linkedin\.com\/in\/[\w%-]+/i);
+  if (liM) result.linkedin = liM[0];
+
+  const ghM = text.match(/github\.com\/[\w-]+/i);
+  if (ghM) result.github = ghM[0];
+
+  const urlM = text.match(/https?:\/\/(?!.*linkedin)(?!.*github)[\w./\-?=%&]+/i);
+  if (urlM) result.portfolio = urlM[0];
+
+  const locM = text.match(/([A-Z][a-zA-Z\s]{2,}),\s*(Nigeria|Ghana|UK|USA|US|Kenya|South Africa|Canada|Australia|Uganda|Tanzania|Zambia|[A-Z][a-z]{3,})/);
+  if (locM) result.location = locM[0].trim();
+
+  // Name: look in first 15 lines for ALL CAPS 2-3 word line, or title-case words
+  for (const line of lines.slice(0, 15)) {
+    const words = line.trim().split(/\s+/);
+    if (words.length < 2 || words.length > 4) continue;
+    if (/[@\d|•\-_]/.test(line)) continue;
+    const allCaps = words.every(w => /^[A-Z]{2,}$/.test(w));
+    const titleCase = words.every(w => /^[A-Z][a-z]+$/.test(w));
+    if (allCaps || titleCase) {
+      result.fname = words[0];
+      result.lname = words.slice(1).join(' ');
+      break;
+    }
   }
+
+  // Section-based parsing
+  const SEC = {
+    experience: /^(experience|work experience|employment history|career|professional experience)\s*$/i,
+    education:  /^(education|academic background|qualifications?)\s*$/i,
+    skills:     /^(skills|technical skills|core competenc|expertise|key skills)\s*$/i,
+    summary:    /^(summary|profile|about me|objective|professional summary|personal statement)\s*$/i,
+    certs:      /^(certifications?|licenses?|awards?|achievements?|courses?)\s*$/i,
+  };
+
+  let section = null;
+  const buckets = { experience:[], education:[], skills:[], summary:[], certs:[] };
+
+  lines.forEach(line => {
+    for (const [s, re] of Object.entries(SEC)) { if (re.test(line)) { section = s; return; } }
+    if (section) buckets[section].push(line);
+  });
+
+  // Summary
+  if (buckets.summary.length) result.summary = buckets.summary.join(' ').substring(0,600);
+
+  // Skills — split on commas, bullets, pipes
+  buckets.skills.forEach(line => {
+    line.split(/[,•·|]/).forEach(s => {
+      const t = s.replace(/^[-–\s]+/,'').trim();
+      if (t && t.length > 1 && t.length < 50 && !result.skills.includes(t)) result.skills.push(t);
+    });
+  });
+
+  // Experience parsing
+  const dateRx = /\b((jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\s*)?\d{4}\s*[-–—to]+\s*((jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\s*\d{4}|present|current|now)/i;
+  const exp = buckets.experience;
+  let ei = 0;
+  while (ei < exp.length) {
+    const line = exp[ei];
+    const hasDate = dateRx.test(line) || (exp[ei+1] && dateRx.test(exp[ei+1]));
+    // Look for "Company | Location (dates)" or "Title at Company"
+    const pipeM = line.match(/^(.+?)\s*[|]\s*(.+?)\s*\((.+?)\)/);
+    const atM = line.match(/^(.+?)\s+at\s+(.+)/i);
+
+    if (hasDate || pipeM || atM) {
+      const e = { title:'', company:'', start:'', end:'', desc:'' };
+      if (pipeM) {
+        e.company = pipeM[1].trim();
+        const dM = pipeM[3].match(/(\w+\s*\d{4}|\d{4})/g);
+        if (dM) { e.start = dM[0]||''; e.end = dM[1]||'Present'; }
+      } else if (atM) {
+        e.title = atM[1].trim(); e.company = atM[2].trim();
+      } else {
+        // Title might be previous line
+        if (ei > 0 && !dateRx.test(exp[ei-1])) e.title = exp[ei-1];
+        e.company = line.replace(dateRx,'').replace(/[|\-–\(\)]/g,'').trim();
+        const dM = (line.match(dateRx)||[''])[0].split(/[-–—to]+/);
+        e.start = dM[0]?.trim()||''; e.end = dM[1]?.trim()||'Present';
+      }
+      // Collect description until next job
+      ei++;
+      const desc = [];
+      while (ei < exp.length && !dateRx.test(exp[ei]) && !exp[ei].match(/^.+[|].+\(/) ) {
+        desc.push(exp[ei]); ei++;
+      }
+      e.desc = desc.join('\n');
+      if (e.company || e.title) result.experience.push(e);
+    } else { ei++; }
+  }
+
+  // Education
+  const degRx = /(b\.?sc|b\.?eng|b\.?a|b\.?tech|m\.?sc|m\.?a|m\.?eng|phd|hnd|bachelor|master|diploma|degree|certificate)/i;
+  buckets.education.forEach((line, i) => {
+    if (degRx.test(line)) {
+      const yM = line.match(/\d{4}/g);
+      result.education.push({ degree: line.replace(/\d{4}/g,'').trim(), school: buckets.education[i+1]||'', years: yM ? yM.join(' – ') : '', grade: '' });
+    }
+  });
+
+  return result;
 }
 
 function nextFromU1() {
